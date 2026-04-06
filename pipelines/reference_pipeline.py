@@ -11,6 +11,7 @@ Matches TIFF dates with shapefiles from D:\STAC\{YEAR}\,
 extracts zonal stats per lot in parallel, saves combined CSV to local output/.
 """
 
+import json
 import os
 import re
 import sys
@@ -34,15 +35,15 @@ warnings.filterwarnings('ignore')
 
 # ── Config ────────────────────────────────────────────────────────────────────
 # YEAR: filter to a single year (optional). If not set, processes all years found.
-YEAR        = os.environ.get('YEAR')
-MAX_WORKERS = int(os.environ.get('MAX_WORKERS', REF_WORKERS))
-
 import sys; sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import STAC_ROOT, REF_ROOT, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
 from config import REF_WORKERS, OUTPUT_ROOT as _OUTPUT_ROOT
 
+YEAR        = os.environ.get('YEAR')
+MAX_WORKERS = int(os.environ.get('MAX_WORKERS', REF_WORKERS))
 OUTPUT_ROOT = _OUTPUT_ROOT / 'reference'
 DB_TABLE    = "reference_indices"
+CHECKPOINT  = _OUTPUT_ROOT / 'checkpoints' / 'reference.json'
 
 LOTE_FIELD = "COD_CG"
 
@@ -52,6 +53,39 @@ COLS = [
     'ndwi11_promedio', 'ndwi11_max', 'ndwi11_min', 'ndwi11_std',
     'msi11_promedio',  'msi11_max',  'msi11_min',  'msi11_std',
 ]
+
+
+# ── Checkpoint ────────────────────────────────────────────────────────────────
+class Checkpoint:
+    """Tracks completed date keys per year in a JSON file."""
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._data = json.loads(self.path.read_text()) if self.path.exists() else {}
+
+    def completed(self, year):
+        return set(self._data.get(str(year), []))
+
+    def mark_done(self, year, key):
+        yr = str(year)
+        self._data.setdefault(yr, [])
+        if key not in self._data[yr]:
+            self._data[yr].append(key)
+        self.path.write_text(json.dumps(self._data, indent=2))
+
+
+# ── Per-year DB flush ─────────────────────────────────────────────────────────
+def _flush_year_to_db(year, rows, engine, log):
+    if not rows:
+        log.warning(f"[{year}] No rows to write to PostgreSQL.")
+        return
+    df = pd.DataFrame(rows, columns=COLS)
+    df['fecha'] = pd.to_datetime(df['fecha'])
+    with engine.connect() as conn:
+        conn.execute(text(f"DELETE FROM {DB_TABLE} WHERE EXTRACT(YEAR FROM fecha) = :y"), {'y': int(year)})
+        conn.commit()
+    df.to_sql(DB_TABLE, engine, if_exists='append', index=False)
+    log.info(f"[{year}] PostgreSQL: {len(rows)} rows written to '{DB_TABLE}'.")
 
 
 # ── Worker logging setup ──────────────────────────────────────────────────────
@@ -236,11 +270,14 @@ if __name__ == '__main__':
         log.error("No years found.")
         sys.exit(1)
 
-    t_inicio = time.time()
+    t_inicio   = time.time()
+    checkpoint = Checkpoint(CHECKPOINT)
+    engine     = create_engine(f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
-    # Collect all work items across all years
-    all_worker_args = []  # list of (date_str, shp, ndvi, ndwi11, msi11)
-    year_of_date    = {}  # date_str -> year (for grouping results)
+    # Collect all work items across all years, skipping already-completed dates
+    all_worker_args  = []
+    year_of_date     = {}
+    pending_per_year = {}
 
     for year in all_years:
         ref_dir  = REF_ROOT  / f'{year}-raster'
@@ -258,11 +295,15 @@ if __name__ == '__main__':
         matching = sorted(set(ndvi_tiffs) & set(ndwi11_tiffs) & set(msi11_tiffs) & set(shp_by_date))
         skipped  = (set(ndvi_tiffs) | set(ndwi11_tiffs) | set(msi11_tiffs)) - set(matching)
 
-        log.info(f"  {year}: {len(matching)} complete dates, {len(skipped)} skipped")
         if skipped:
-            log.warning(f"  {year} skipped: {sorted(skipped)}")
+            log.warning(f"  {year} skipped (incomplete TIFFs): {sorted(skipped)}")
 
-        for d in matching:
+        done    = checkpoint.completed(year)
+        pending = [d for d in matching if d not in done]
+        log.info(f"  {year}: {len(matching)} complete dates, {len(done)} already done, {len(pending)} pending")
+
+        pending_per_year[year] = len(pending)
+        for d in pending:
             all_worker_args.append((d, str(shp_by_date[d]), str(ndvi_tiffs[d]), str(ndwi11_tiffs[d]), str(msi11_tiffs[d])))
             year_of_date[d] = year
 
@@ -279,43 +320,35 @@ if __name__ == '__main__':
             try:
                 result = future.result()
                 results_by_year.setdefault(year, []).extend(result)
+                checkpoint.mark_done(year, date_str)
                 log.info(f"Collected {len(result)} rows from {date_str} ({year})")
             except Exception as e:
                 log.error(f"Worker failed for {date_str}: {e}")
 
-    # Write one CSV per year
-    total_rows = 0
-    for year in sorted(results_by_year):
-        rows = results_by_year[year]
-        if not rows:
-            log.warning(f"{year}: no results.")
-            continue
-        output_dir = OUTPUT_ROOT / year
-        output_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = output_dir / f"{year}_indices_ref.csv"
-        df = pd.DataFrame(rows, columns=COLS)
-        df.to_csv(str(csv_path), index=False, encoding='utf-8-sig')
-        con_valor = sum(1 for r in rows if r['ndvi_promedio'] is not None)
-        log.info(f"[{year}] CSV saved: {csv_path} — {len(rows)} rows, {con_valor} with NDVI")
-        total_rows += len(rows)
+            # Flush year to CSV + DB when all its dates are done
+            pending_per_year[year] -= 1
+            if pending_per_year[year] == 0:
+                rows = results_by_year.get(year, [])
+                if rows:
+                    output_dir = OUTPUT_ROOT / year
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    csv_path = output_dir / f"{year}_indices_ref.csv"
+                    df = pd.DataFrame(rows, columns=COLS)
+                    df.to_csv(str(csv_path), index=False, encoding='utf-8-sig')
+                    con_valor = sum(1 for r in rows if r['ndvi_promedio'] is not None)
+                    log.info(f"[{year}] CSV saved: {csv_path} — {len(rows)} rows, {con_valor} with NDVI")
+                    _flush_year_to_db(year, rows, engine, log)
+                else:
+                    log.warning(f"[{year}] No results to write.")
 
-    elapsed = time.time() - t_inicio
-    mem     = psutil.virtual_memory()
-    log.info(f"=== Done: {total_rows} total rows across {len(results_by_year)} year(s) — {elapsed:.1f}s ===")
+    # Ensure indexes exist
+    with engine.connect() as conn:
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE}_lote  ON {DB_TABLE} (lote)"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE}_fecha ON {DB_TABLE} (fecha)"))
+        conn.commit()
+
+    total_rows = sum(len(v) for v in results_by_year.values())
+    elapsed    = time.time() - t_inicio
+    mem        = psutil.virtual_memory()
+    log.info(f"=== Done: {total_rows} rows across {len(results_by_year)} year(s) — {elapsed:.1f}s ===")
     log.info(f"[METRICS] RAM: {mem.used/1024**3:.2f}/{mem.total/1024**3:.2f} GB ({mem.percent:.1f}%)")
-
-    # ── Write all years combined to PostgreSQL ────────────────────────────────
-    all_rows = [row for rows in results_by_year.values() for row in rows]
-    if all_rows:
-        log.info(f"Writing {len(all_rows)} rows to PostgreSQL table '{DB_TABLE}'...")
-        engine = create_engine(f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
-        df_all = pd.DataFrame(all_rows, columns=COLS)
-        df_all['fecha'] = pd.to_datetime(df_all['fecha'])
-        df_all.to_sql(DB_TABLE, engine, if_exists='replace', index=False)
-
-        with engine.connect() as conn:
-            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE}_lote  ON {DB_TABLE} (lote)"))
-            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE}_fecha ON {DB_TABLE} (fecha)"))
-            conn.commit()
-
-        log.info(f"PostgreSQL: table '{DB_TABLE}' written and indexed.")

@@ -14,6 +14,7 @@ Formulas:
   MSI-11  = SWIR16 / NIR
 """
 
+import json
 import os
 import re
 import sys
@@ -48,6 +49,7 @@ YEAR        = os.environ.get('YEAR')
 MAX_WORKERS = int(os.environ.get('MAX_WORKERS', STAC_WORKERS))
 OUTPUT_ROOT = _OUTPUT_ROOT / 'stac'
 DB_TABLE    = "stac_indices"
+CHECKPOINT  = _OUTPUT_ROOT / 'checkpoints' / 'stac.json'
 
 STAC_URL   = "https://earth-search.aws.element84.com/v1"
 CLOUD_MAX  = 100
@@ -62,6 +64,39 @@ COLS = [
     'ndwi11_promedio', 'ndwi11_max', 'ndwi11_min', 'ndwi11_std',
     'msi11_promedio',  'msi11_max',  'msi11_min',  'msi11_std',
 ]
+
+
+# ── Checkpoint ────────────────────────────────────────────────────────────────
+class Checkpoint:
+    """Tracks completed date keys per year in a JSON file."""
+    def __init__(self, path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._data = json.loads(self.path.read_text()) if self.path.exists() else {}
+
+    def completed(self, year):
+        return set(self._data.get(str(year), []))
+
+    def mark_done(self, year, key):
+        yr = str(year)
+        self._data.setdefault(yr, [])
+        if key not in self._data[yr]:
+            self._data[yr].append(key)
+        self.path.write_text(json.dumps(self._data, indent=2))
+
+
+# ── Per-year DB flush ─────────────────────────────────────────────────────────
+def _flush_year_to_db(year, rows, engine, log):
+    if not rows:
+        log.warning(f"[{year}] No rows to write to PostgreSQL.")
+        return
+    df = pd.DataFrame(rows, columns=COLS)
+    df['fecha'] = pd.to_datetime(df['fecha'])
+    with engine.connect() as conn:
+        conn.execute(text(f"DELETE FROM {DB_TABLE} WHERE EXTRACT(YEAR FROM fecha) = :y"), {'y': int(year)})
+        conn.commit()
+    df.to_sql(DB_TABLE, engine, if_exists='append', index=False)
+    log.info(f"[{year}] PostgreSQL: {len(rows)} rows written to '{DB_TABLE}'.")
 
 
 # ── Worker logging setup ──────────────────────────────────────────────────────
@@ -333,66 +368,76 @@ if __name__ == '__main__':
         log.error("No years found.")
         sys.exit(1)
 
-    t_inicio = time.time()
+    t_inicio    = time.time()
+    checkpoint  = Checkpoint(CHECKPOINT)
+    engine      = create_engine(f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
 
-    # Collect all shapefiles across all years, tagged with their year
-    all_shp_files = []
+    # Collect shapefiles, skipping already-completed dates
+    all_shp_files   = []
+    pending_per_year = {}   # year -> remaining count
+    total_per_year   = {}   # year -> total shapefiles (for CSV flush logic)
+
     for year in all_years:
         stac_dir = STAC_ROOT / year
-        shps = sorted(stac_dir.glob('*.shp'))
-        log.info(f"  {year}: {len(shps)} shapefile(s)")
-        all_shp_files.extend(shps)
+        shps     = sorted(stac_dir.glob('*.shp'))
+        done     = checkpoint.completed(year)
+        pending  = []
+        for shp in shps:
+            m = re.search(r'(\d{8})', shp.stem)
+            key = m.group(1) if m else shp.stem
+            if key in done:
+                log.info(f"  [{year}] Skipping {shp.name} (checkpoint)")
+            else:
+                pending.append(shp)
+        total_per_year[year]   = len(shps)
+        pending_per_year[year] = len(pending)
+        log.info(f"  {year}: {len(shps)} total, {len(pending)} pending, {len(done)} already done")
+        all_shp_files.extend(pending)
 
-    log.info(f"Total shapefiles: {len(all_shp_files)}")
+    log.info(f"Total shapefiles to process: {len(all_shp_files)}")
 
-    # Run all in parallel — workers are year-agnostic (they get the full path)
-    results_by_year = {}  # year -> list of rows
+    # Run all in parallel
+    results_by_year = {}
 
     with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(process_single_shp, shp): shp for shp in all_shp_files}
         for future in as_completed(futures):
-            shp = futures[future]
+            shp  = futures[future]
             year = shp.parent.name
+            m    = re.search(r'(\d{8})', shp.stem)
+            key  = m.group(1) if m else shp.stem
             try:
                 result = future.result()
                 results_by_year.setdefault(year, []).extend(result)
+                checkpoint.mark_done(year, key)
                 log.info(f"Collected {len(result)} rows from {shp.name} ({year})")
             except Exception as e:
                 log.error(f"Worker failed for {shp.name}: {e}")
 
-    # Write one CSV per year
-    total_rows = 0
-    for year in sorted(results_by_year):
-        rows = results_by_year[year]
-        if not rows:
-            log.warning(f"{year}: no results.")
-            continue
-        output_dir = OUTPUT_ROOT / year
-        output_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = output_dir / f"{year}_indices_stac.csv"
-        df = pd.DataFrame(rows, columns=COLS)
-        df.to_csv(str(csv_path), index=False, encoding='utf-8-sig')
-        con_valor = sum(1 for r in rows if r['ndvi_promedio'] is not None)
-        log.info(f"[{year}] CSV saved: {csv_path} — {len(rows)} rows, {con_valor} with NDVI")
-        total_rows += len(rows)
+            # Flush year to CSV + DB when all its shapefiles are done
+            pending_per_year[year] -= 1
+            if pending_per_year[year] == 0:
+                rows = results_by_year.get(year, [])
+                if rows:
+                    output_dir = OUTPUT_ROOT / year
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    csv_path = output_dir / f"{year}_indices_stac.csv"
+                    df = pd.DataFrame(rows, columns=COLS)
+                    df.to_csv(str(csv_path), index=False, encoding='utf-8-sig')
+                    con_valor = sum(1 for r in rows if r['ndvi_promedio'] is not None)
+                    log.info(f"[{year}] CSV saved: {csv_path} — {len(rows)} rows, {con_valor} with NDVI")
+                    _flush_year_to_db(year, rows, engine, log)
+                else:
+                    log.warning(f"[{year}] No results to write.")
 
-    elapsed = time.time() - t_inicio
-    mem     = psutil.virtual_memory()
-    log.info(f"=== Done: {total_rows} total rows across {len(results_by_year)} year(s) — {elapsed:.1f}s ===")
+    # Ensure indexes exist
+    with engine.connect() as conn:
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE}_lote  ON {DB_TABLE} (lote)"))
+        conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE}_fecha ON {DB_TABLE} (fecha)"))
+        conn.commit()
+
+    total_rows = sum(len(v) for v in results_by_year.values())
+    elapsed    = time.time() - t_inicio
+    mem        = psutil.virtual_memory()
+    log.info(f"=== Done: {total_rows} rows across {len(results_by_year)} year(s) — {elapsed:.1f}s ===")
     log.info(f"[METRICS] RAM: {mem.used/1024**3:.2f}/{mem.total/1024**3:.2f} GB ({mem.percent:.1f}%)")
-
-    # ── Write all years combined to PostgreSQL ────────────────────────────────
-    all_rows = [row for rows in results_by_year.values() for row in rows]
-    if all_rows:
-        log.info(f"Writing {len(all_rows)} rows to PostgreSQL table '{DB_TABLE}'...")
-        engine = create_engine(f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
-        df_all = pd.DataFrame(all_rows, columns=COLS)
-        df_all['fecha'] = pd.to_datetime(df_all['fecha'])
-        df_all.to_sql(DB_TABLE, engine, if_exists='replace', index=False)
-
-        with engine.connect() as conn:
-            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE}_lote  ON {DB_TABLE} (lote)"))
-            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE}_fecha ON {DB_TABLE} (fecha)"))
-            conn.commit()
-
-        log.info(f"PostgreSQL: table '{DB_TABLE}' written and indexed.")
