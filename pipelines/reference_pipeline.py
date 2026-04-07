@@ -75,16 +75,38 @@ class Checkpoint:
 
 
 # ── Per-year DB flush ─────────────────────────────────────────────────────────
+def _ensure_table(engine):
+    with engine.begin() as conn:
+        conn.execute(text(f"""
+            CREATE TABLE IF NOT EXISTS {DB_TABLE} (
+                lote             TEXT,
+                fecha            DATE,
+                imagen_id        TEXT,
+                ndvi_promedio    DOUBLE PRECISION,
+                ndvi_max         DOUBLE PRECISION,
+                ndvi_min         DOUBLE PRECISION,
+                ndvi_std         DOUBLE PRECISION,
+                ndwi11_promedio  DOUBLE PRECISION,
+                ndwi11_max       DOUBLE PRECISION,
+                ndwi11_min       DOUBLE PRECISION,
+                ndwi11_std       DOUBLE PRECISION,
+                msi11_promedio   DOUBLE PRECISION,
+                msi11_max        DOUBLE PRECISION,
+                msi11_min        DOUBLE PRECISION,
+                msi11_std        DOUBLE PRECISION
+            )
+        """))
+
+
 def _flush_year_to_db(year, rows, engine, log):
     if not rows:
         log.warning(f"[{year}] No rows to write to PostgreSQL.")
         return
     df = pd.DataFrame(rows, columns=COLS)
     df['fecha'] = pd.to_datetime(df['fecha'])
-    with engine.connect() as conn:
+    with engine.begin() as conn:
         conn.execute(text(f"DELETE FROM {DB_TABLE} WHERE EXTRACT(YEAR FROM fecha) = :y"), {'y': int(year)})
-        conn.commit()
-    df.to_sql(DB_TABLE, engine, if_exists='append', index=False)
+        df.to_sql(DB_TABLE, conn, if_exists='append', index=False, chunksize=1000, method='multi')
     log.info(f"[{year}] PostgreSQL: {len(rows)} rows written to '{DB_TABLE}'.")
 
 
@@ -273,6 +295,7 @@ if __name__ == '__main__':
     t_inicio   = time.time()
     checkpoint = Checkpoint(CHECKPOINT)
     engine     = create_engine(f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
+    _ensure_table(engine)
 
     # Collect all work items across all years, skipping already-completed dates
     all_worker_args  = []
@@ -332,11 +355,11 @@ if __name__ == '__main__':
                 if rows:
                     output_dir = OUTPUT_ROOT / year
                     output_dir.mkdir(parents=True, exist_ok=True)
-                    csv_path = output_dir / f"{year}_indices_ref.csv"
+                    parquet_path = output_dir / f"{year}_indices_ref.parquet"
                     df = pd.DataFrame(rows, columns=COLS)
-                    df.to_csv(str(csv_path), index=False, encoding='utf-8-sig')
+                    df.to_parquet(str(parquet_path), index=False)
                     con_valor = sum(1 for r in rows if r['ndvi_promedio'] is not None)
-                    log.info(f"[{year}] CSV saved: {csv_path} — {len(rows)} rows, {con_valor} with NDVI")
+                    log.info(f"[{year}] Parquet saved: {parquet_path} — {len(rows)} rows, {con_valor} with NDVI")
                     _flush_year_to_db(year, rows, engine, log)
                 else:
                     log.warning(f"[{year}] No results to write.")
