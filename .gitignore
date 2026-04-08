@@ -1,8 +1,13 @@
-# Output
-output/
+# Terraform state (contains sensitive resource info — use remote backend in production)
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
 
-# Local config (contains credentials and machine-specific paths)
-config.py
+# Batch job ID logs (generated at submission time)
+batch/job_ids_*.json
+
+# Claude settings
+.claude/
 
 # Python
 __pycache__/

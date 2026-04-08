@@ -1,0 +1,12 @@
+numpy
+pandas
+geopandas
+rasterio
+fiona
+pystac-client
+shapely
+boto3
+psutil
+rasterstats
+affine
+pyarrow
