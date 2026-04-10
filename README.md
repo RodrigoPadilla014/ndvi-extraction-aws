@@ -102,3 +102,74 @@ Logs are available in CloudWatch:
 ```
 AWS Console → CloudWatch → Log groups → /aws/batch/ndvi-extraction
 ```
+
+---
+
+## EDA — STAC Correction Factors
+
+The STAC pipeline computes indices from raw Sentinel-2 COG bands on the fly. Field cross-validations confirmed these values are systematically off compared to the Reference pipeline, which uses pre-validated TIFFs.
+
+The `eda/` folder contains the analysis and scripts to derive and apply a per-index linear correction: `Reference = slope * STAC + intercept`.
+
+### Correction model
+
+| Index | Model | Slope | Intercept | CV R² |
+|-------|-------|-------|-----------|-------|
+| NDVI | OLS | 0.8335 | 0.0069 | 0.950 |
+| NDWI-11 | OLS | 0.8971 | 0.1013 | 0.958 |
+| MSI-11 | Huber | 0.7499 | 0.0578 | 0.894 |
+
+Trained on 2020–2024, validated on held-out 2025. Coefficients stored in `eda/correction_factors.json` under the `validation_1` key.
+
+### Scripts
+
+| Script | Description |
+|--------|-------------|
+| `eda/utils.py` | Shared data loading and cleaning |
+| `eda/explore.py` | Scatter plots, residual distributions, per-year bias |
+| `eda/fit_correction.py` | Fits correction models, runs CV, saves coefficients to JSON |
+| `eda/apply_correction.py` | Applies correction factors to matched dataset, outputs CSV |
+| `tools/convert_ppk.py` | One-time conversion of PuTTY `.ppk` key to OpenSSH `.pem` |
+| `db/upload_to_db.py` | Uploads corrected output to PostgreSQL via SSH tunnel |
+
+### Run order
+
+```bash
+# 1. Explore the data
+python eda/explore.py
+
+# 2. Fit correction factors
+python eda/fit_correction.py
+
+# 3. Apply correction and generate output
+python eda/apply_correction.py
+
+# 4. (One-time) Convert SSH key if needed
+python tools/convert_ppk.py
+
+# 5. Upload to database
+python db/upload_to_db.py
+```
+
+### Database output
+
+Table `stac_corrected_indices` in PostgreSQL (`DB_Lake`):
+
+| Column | Description |
+|--------|-------------|
+| lote | Lot identifier |
+| fecha | Date |
+| ndvi_corrected | Corrected STAC NDVI |
+| ndvi_ref | Reference NDVI |
+| ndwi11_corrected | Corrected STAC NDWI-11 |
+| ndwi11_ref | Reference NDWI-11 |
+| msi11_corrected | Corrected STAC MSI-11 |
+| msi11_ref | Reference MSI-11 |
+
+### Setup
+
+Copy `.env.example` to `.env` and fill in your credentials:
+
+```bash
+cp .env.example .env
+```

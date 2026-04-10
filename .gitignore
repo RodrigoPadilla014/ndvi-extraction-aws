@@ -25,6 +25,15 @@ build/
 env/
 venv/
 
+# SSH keys
+keys/
+
+# Large generated data files
+eda/corrected_output.csv
+eda/corrected_output.parquet
+eda/data/
+eda/plots/
+
 # Jupyter
 .ipynb_checkpoints/
 
