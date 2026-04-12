@@ -1,6 +1,6 @@
-# NDVI AWS Pipeline
+## NDVI Extraction Pipeline — Sentinel-2 Vegetation Indices for Sugarcane Yield Forecasting
 
-Processes Sentinel-2 satellite imagery to extract per-lot vegetation indices (NDVI, NDWI-11, MSI-11) for sugarcane lots. Runs on AWS Batch with inputs and outputs stored in S3.
+This pipeline extracts field-level vegetation indices from Sentinel-2 satellite imagery for ~11,000 sugarcane lots across Guatemala's Pacific coast, producing the satellite feature set that feeds CENGICAÑA's sugarcane yield forecasting models. It runs on AWS Batch and supports two modes: a STAC pipeline that queries and processes raw satellite bands on the fly via the Element84 API, and a reference pipeline that extracts statistics from pre-validated GeoTIFF composites. Because the two sources produce systematically different index values, the project also includes a cross-validated correction step — OLS and Huber regression models (R² 0.89–0.96) trained on 2020–2024 data — that aligns STAC output to the reference standard before results are loaded into PostgreSQL
 
 ## Pipelines
 
