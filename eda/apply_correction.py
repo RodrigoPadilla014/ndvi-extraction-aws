@@ -37,7 +37,7 @@ def main() -> None:
     df = build_matched(ref, stac)
     print(f"  {len(df):,} matched rows")
 
-    keep = ["lote", "fecha", "year"]
+    keep = ["lote", "fecha", "year", "imagen_id"]
     for idx in INDICES:
         slope = factors[idx]["slope"]
         intercept = factors[idx]["intercept"]
@@ -51,7 +51,7 @@ def main() -> None:
 
         keep += [f"{idx}_corrected", f"{idx}_ref", f"{idx}_diff"]
 
-    out = df[keep]
+    out = df[keep].rename(columns={"lote": "cod_cg", "imagen_id": "id_img"})
     out.to_csv(OUTPUT_PATH, index=False)
     print(f"\nSaved {len(out):,} rows to {OUTPUT_PATH}")
 

@@ -11,12 +11,14 @@ Run from project root:
 """
 
 import os
+import socket
+import subprocess
+import time
 from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine
-from sshtunnel import SSHTunnelForwarder
 
 PROJECT_ROOT = Path(__file__).parent.parent
 INPUT_PATH = PROJECT_ROOT / "eda" / "corrected_output.csv"
@@ -37,11 +39,17 @@ DB_PASSWORD = os.environ["DB_PASSWORD"]
 TABLE_NAME = "stac_corrected_indices"
 
 COLUMNS = [
-    "lote", "fecha",
+    "cod_cg", "fecha", "id_img",
     "ndvi_corrected", "ndvi_ref",
     "ndwi11_corrected", "ndwi11_ref",
     "msi11_corrected", "msi11_ref",
 ]
+
+
+def find_free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def main() -> None:
@@ -49,22 +57,28 @@ def main() -> None:
     df = pd.read_csv(INPUT_PATH, usecols=COLUMNS, parse_dates=["fecha"])
     print(f"  {len(df):,} rows")
 
-    print(f"Opening SSH tunnel to {SSH_HOST}...")
-    with SSHTunnelForwarder(
-        (SSH_HOST, SSH_PORT),
-        ssh_username=SSH_USER,
-        ssh_pkey=str(SSH_KEY),
-        remote_bind_address=(DB_HOST, DB_PORT),
-    ) as tunnel:
-        local_port = tunnel.local_bind_port
-        print(f"  Tunnel open on local port {local_port}")
+    local_port = find_free_port()
+    print(f"Opening SSH tunnel to {SSH_HOST} on local port {local_port}...")
+    tunnel = subprocess.Popen([
+        "ssh", "-N",
+        "-L", f"{local_port}:{DB_HOST}:{DB_PORT}",
+        "-i", str(SSH_KEY),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "BatchMode=yes",
+        "-p", str(SSH_PORT),
+        f"{SSH_USER}@{SSH_HOST}",
+    ])
+    time.sleep(3)
 
+    try:
         db_url = f"postgresql://{DB_USER}:{DB_PASSWORD}@127.0.0.1:{local_port}/{DB_NAME}"
         engine = create_engine(db_url)
 
         print(f"Uploading to {TABLE_NAME}...")
         df.to_sql(TABLE_NAME, engine, if_exists="replace", index=False, chunksize=10_000)
         print(f"Done. {len(df):,} rows written to {TABLE_NAME}.")
+    finally:
+        tunnel.terminate()
 
 
 if __name__ == "__main__":

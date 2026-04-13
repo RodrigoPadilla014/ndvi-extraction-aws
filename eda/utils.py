@@ -47,7 +47,7 @@ def load_stac() -> pd.DataFrame:
     for year in YEARS:
         folder = DATA_DIR / "stac" / str(year)
         for path in sorted(folder.glob("*.parquet")):
-            df = pd.read_parquet(path, columns=["lote", "fecha"] + INDEX_COLS)
+            df = pd.read_parquet(path, columns=["lote", "fecha", "imagen_id"] + INDEX_COLS)
             df = clean_index_columns(df)
             frames.append(df)
     combined = pd.concat(frames, ignore_index=True)
