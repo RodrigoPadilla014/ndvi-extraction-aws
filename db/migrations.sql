@@ -59,3 +59,27 @@ SELECT
     p.ultima_imagen, p.ndvi, p.ndwi_11, p.ndwi_12, p.msi_11, p.msi_12
 FROM stac_corrected_indices s
 LEFT JOIN productividad p ON s.cod_cg_zafra = p.cod_cg_zafra;
+
+-- 2026-04-15: Add edad_de_cultivo column to maestra
+-- Age of crop in days: fecha - cierre of the previous zafra for the same cod_cg
+-- cierre marks end of a cycle and start of the next; first cycle per lot gets NULL
+
+ALTER TABLE maestra ADD COLUMN IF NOT EXISTS edad_de_cultivo integer;
+
+WITH distinct_cierre AS (
+    SELECT DISTINCT cod_cg, zafra, cierre
+    FROM maestra
+    WHERE cierre IS NOT NULL
+),
+lagged_cierre AS (
+    SELECT
+        cod_cg, zafra,
+        LAG(cierre) OVER (PARTITION BY cod_cg ORDER BY zafra) AS prev_cierre
+    FROM distinct_cierre
+)
+UPDATE maestra m
+SET edad_de_cultivo = m.fecha::date - TO_DATE(lc.prev_cierre, 'DD/MM/YYYY')
+FROM lagged_cierre lc
+WHERE m.cod_cg = lc.cod_cg
+  AND m.zafra = lc.zafra
+  AND lc.prev_cierre IS NOT NULL;
