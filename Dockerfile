@@ -5,14 +5,14 @@ FROM python:3.11-bookworm
 
 # ── Python dependencies ───────────────────────────────────────────────────────
 # rasterio and fiona wheels from PyPI include GDAL bundled inside them
-COPY scripts/requirements.txt /app/scripts_requirements.txt
-COPY reference/requirements.txt /app/reference_requirements.txt
-RUN pip install --no-cache-dir -r /app/scripts_requirements.txt && \
-    pip install --no-cache-dir -r /app/reference_requirements.txt
+COPY pipelines/requirements_stac.txt /app/requirements_stac.txt
+COPY pipelines/requirements_reference.txt /app/requirements_reference.txt
+RUN pip install --no-cache-dir -r /app/requirements_stac.txt && \
+    pip install --no-cache-dir -r /app/requirements_reference.txt
 
 # ── Application ───────────────────────────────────────────────────────────────
-COPY scripts/process_shapefile.py /app/process_shapefile.py
-COPY reference/process_reference_tiff.py /app/process_reference_tiff.py
+COPY pipelines/process_shapefile.py /app/process_shapefile.py
+COPY pipelines/process_reference_tiff.py /app/process_reference_tiff.py
 COPY entrypoint.sh /app/entrypoint.sh
 
 RUN chmod +x /app/entrypoint.sh

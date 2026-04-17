@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import sys; sys.path.insert(0, str(Path(__file__).parent))
 from utils import INDICES, build_matched, load_reference, load_stac
 
 EDA_DIR = Path(__file__).parent

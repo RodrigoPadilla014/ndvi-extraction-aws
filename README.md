@@ -1,33 +1,37 @@
 ## NDVI Extraction Pipeline — Sentinel-2 Vegetation Indices for Sugarcane Yield Forecasting
 
-This pipeline extracts field-level vegetation indices from Sentinel-2 satellite imagery for ~11,000 sugarcane lots across Guatemala's Pacific coast, producing the satellite feature set that feeds CENGICAÑA's sugarcane yield forecasting models. It runs on AWS Batch and supports two modes: a STAC pipeline that queries and processes raw satellite bands on the fly via the Element84 API, and a reference pipeline that extracts statistics from pre-validated GeoTIFF composites. Because the two sources produce systematically different index values, the project also includes a cross-validated correction step — OLS and Huber regression models (R² 0.89–0.96) trained on 2020–2024 data — that aligns STAC output to the reference standard before results are loaded into PostgreSQL
+This pipeline extracts field-level vegetation indices from Sentinel-2 satellite imagery for ~11,000 sugarcane lots across Guatemala's Pacific coast, producing the satellite feature set that feeds CENGICAÑA's sugarcane yield forecasting models. It runs on AWS Batch and supports two modes: a STAC pipeline that queries and processes raw satellite bands on the fly via the Element84 API, and a reference pipeline that extracts statistics from pre-validated GeoTIFF composites. Because the two sources produce systematically different index values, the project also includes a cross-validated correction step — OLS and Huber regression models (R² 0.89–0.96) trained on 2020–2024 data — that aligns STAC output to the reference standard before results are loaded into PostgreSQL.
+
+## Project Structure
+
+```
+pipelines/        — AWS Batch pipeline scripts (STAC + Reference)
+eda/
+  correction/     — STAC correction factor analysis and application
+  viz/            — Interactive HTML visualizations (lot history, growth curves)
+db/               — Migrations and DB upload scripts
+  migrations/     — Numbered SQL migrations (001–011)
+queries/          — SELECT queries and ML dataset definitions
+terraform/        — AWS infrastructure (Batch, ECR, IAM, CloudWatch)
+batch/            — Job submission scripts
+tools/            — One-time utilities
+```
 
 ## Pipelines
 
-### STAC Pipeline (`scripts/process_shapefile.py`)
+### STAC Pipeline (`pipelines/process_shapefile.py`)
 - One AWS Batch job per shapefile
 - Downloads shapefiles from `s3://ndvi-extraction/STAC/{year}/`
 - Queries Sentinel-2 imagery via STAC API (element84)
 - Computes NDVI, NDWI-11, MSI-11 from raw NIR/RED/SWIR16 bands
 - Uploads Parquet to `s3://ndvi-extraction/output/stac/{year}/`
 
-### Reference Pipeline (`reference/process_reference_tiff.py`)
+### Reference Pipeline (`pipelines/process_reference_tiff.py`)
 - One AWS Batch job per year
 - Downloads pre-computed index TIFFs from `s3://ndvi-extraction/Reference/{year}-raster/`
 - Matches TIFFs with shapefiles by date
 - Extracts zonal statistics per lot
 - Uploads Parquet to `s3://ndvi-extraction/output/reference/{year}/`
-
-## Output columns
-
-| Column | Description |
-|--------|-------------|
-| lote | Lot identifier (COD_CG) |
-| fecha | Date (YYYY-MM-DD) |
-| imagen_id | Sentinel-2 image ID |
-| ndvi_promedio / _max / _min / _std | NDVI statistics |
-| ndwi11_promedio / _max / _min / _std | NDWI-11 statistics |
-| msi11_promedio / _max / _min / _std | MSI-11 statistics |
 
 ## S3 Structure
 
@@ -65,7 +69,7 @@ The S3 bucket is not managed by Terraform — it is referenced by name only.
 
 ```bash
 git clone <repo>
-cd ndvi-extraction-aws
+cd ndvi-extraction-locally
 
 # Deploy infrastructure
 cd terraform
@@ -109,7 +113,7 @@ AWS Console → CloudWatch → Log groups → /aws/batch/ndvi-extraction
 
 The STAC pipeline computes indices from raw Sentinel-2 COG bands on the fly. Field cross-validations confirmed these values are systematically off compared to the Reference pipeline, which uses pre-validated TIFFs.
 
-The `eda/` folder contains the analysis and scripts to derive and apply a per-index linear correction: `Reference = slope * STAC + intercept`.
+`eda/correction/` contains the analysis and scripts to derive and apply a per-index linear correction: `Reference = slope * STAC + intercept`.
 
 ### Correction model
 
@@ -119,54 +123,106 @@ The `eda/` folder contains the analysis and scripts to derive and apply a per-in
 | NDWI-11 | OLS | 0.8971 | 0.1013 | 0.958 |
 | MSI-11 | Huber | 0.7499 | 0.0578 | 0.894 |
 
-Trained on 2020–2024, validated on held-out 2025. Coefficients stored in `eda/correction_factors.json` under the `validation_1` key.
+Trained on 2020–2024, validated on held-out 2025. Coefficients stored in `eda/correction/correction_factors.json` under the `validation_1` key.
 
 ### Scripts
 
 | Script | Description |
 |--------|-------------|
-| `eda/utils.py` | Shared data loading and cleaning |
-| `eda/explore.py` | Scatter plots, residual distributions, per-year bias |
-| `eda/fit_correction.py` | Fits correction models, runs CV, saves coefficients to JSON |
-| `eda/apply_correction.py` | Applies correction factors to matched dataset, outputs CSV |
-| `tools/convert_ppk.py` | One-time conversion of PuTTY `.ppk` key to OpenSSH `.pem` |
+| `eda/correction/utils.py` | Shared data loading and cleaning |
+| `eda/correction/explore.py` | Scatter plots, residual distributions, per-year bias |
+| `eda/correction/fit_correction.py` | Fits correction models, runs CV, saves coefficients to JSON |
+| `eda/correction/apply_correction.py` | Applies correction factors to matched dataset, outputs CSV |
 | `db/upload_to_db.py` | Uploads corrected output to PostgreSQL via SSH tunnel |
+| `tools/convert_ppk.py` | One-time conversion of PuTTY `.ppk` key to OpenSSH `.pem` |
 
 ### Run order
 
 ```bash
-# 1. Explore the data
-python eda/explore.py
-
-# 2. Fit correction factors
-python eda/fit_correction.py
-
-# 3. Apply correction and generate output
-python eda/apply_correction.py
-
-# 4. (One-time) Convert SSH key if needed
-python tools/convert_ppk.py
-
-# 5. Upload to database
+python eda/correction/explore.py
+python eda/correction/fit_correction.py
+python eda/correction/apply_correction.py
 python db/upload_to_db.py
 ```
 
-### Database output
+---
 
-Table `stac_corrected_indices` in PostgreSQL (`DB_Lake`):
+## Database — `maestra` Table
+
+PostgreSQL table in `DB_Lake` (148.113.225.209). Created as a LEFT JOIN of `stac_corrected_indices` with `productividad` on `cod_cg_zafra`. ~1.5M rows covering 2020–2025.
+
+### Key columns
 
 | Column | Description |
 |--------|-------------|
-| lote | Lot identifier |
-| fecha | Date |
-| ndvi_corrected | Corrected STAC NDVI |
-| ndvi_ref | Reference NDVI |
-| ndwi11_corrected | Corrected STAC NDWI-11 |
-| ndwi11_ref | Reference NDWI-11 |
-| msi11_corrected | Corrected STAC MSI-11 |
-| msi11_ref | Reference MSI-11 |
+| `cod_cg` | Lot identifier |
+| `fecha` | Observation date |
+| `zafra` | Nov-Oct calendar season (e.g. `2020_2021`) |
+| `cierre_ciclo` | Next harvest date >= fecha — defines the agronomic cycle |
+| `edad_de_cultivo` | Days since previous harvest (resets at each cycle boundary) |
+| `gap_in_data` | TRUE if gap between consecutive harvests > 548 days |
+| `ciclo_valido` | TRUE if cycle is clean enough for ML training |
+| `ndvi_ref`, `ndwi11_ref`, `msi11_ref` | Reference pipeline indices (primary source) |
+| `ndvi_corrected`, `ndwi11_corrected`, `msi11_corrected` | Corrected STAC indices |
+| `tch` | Yield in toneladas de caña por hectárea (target variable) |
 
-### Setup
+### Migrations
+
+Numbered SQL files in `db/migrations/`. Run with `python db/migrate.py`.
+
+| Migration | Description |
+|-----------|-------------|
+| 001 | Add `zafra` and `cod_cg_zafra` join keys |
+| 002 | Create `maestra` table via LEFT JOIN |
+| 003 | Add `edad_de_cultivo` (initial version) |
+| 007 | Add `cierre_ciclo` (agronomic cycle boundary) |
+| 008 | Recalculate `edad_de_cultivo` using `cierre_ciclo` |
+| 009 | Add `gap_in_data` flag |
+| 010 | Detect renovation cycles in lots missing from productividad |
+| 011 | Add `ciclo_valido` boolean |
+
+> Migrations 004–006 are superseded by 007–010 and not applied (tracked in `_migrations` to prevent accidental execution).
+
+### `cierre_ciclo` vs `zafra`
+
+`zafra` is the Nov-Oct administrative calendar window. `cierre_ciclo` is the actual next harvest date the plant is growing toward — these differ for observations after a harvest but still within the same zafra window. `cierre_ciclo` is the correct grouping for agronomic analysis.
+
+---
+
+## ML Dataset
+
+**628,522 rows** across **34,033 (lot, zafra) samples** (2020–2025), ready for yield prediction.
+
+Filters applied:
+- `ciclo_valido = TRUE` — clean cycle (known start + end, no data gap, ≥7 observations, max edad ≥150 days)
+- `cierre IS NOT NULL` — has a yield label from productividad
+
+Fetch query: `queries/ml_dataset.sql`
+
+### Valid cycle distribution
+
+| Range (days) | % of valid cycles |
+|---|---|
+| 300–350 | 35.2% |
+| 350–400 | 45.6% |
+| Other | 19.2% |
+
+80.8% of valid cycles fall between 300–400 days — consistent annual sugarcane harvest cycle.
+
+### Visualizations
+
+```bash
+# Lot history — NDVI over time colored by agronomic cycle
+python eda/viz/lot_history.py        → eda/viz/lot_history.html
+
+# Growth curves — NDVI vs edad_de_cultivo per lot
+python eda/viz/ndvi_growth_curves.py → eda/viz/ndvi_growth_curves.html
+
+# Cultivo renovado — renovation-detected cycles
+python eda/viz/cultivo_renovado.py   → eda/viz/cultivo_renovado.html
+```
+
+### Environment
 
 Copy `.env.example` to `.env` and fill in your credentials:
 

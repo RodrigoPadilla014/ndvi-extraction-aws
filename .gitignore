@@ -29,10 +29,10 @@ venv/
 keys/
 
 # Large generated data files
-eda/corrected_output.csv
-eda/corrected_output.parquet
-eda/data/
-eda/plots/
+eda/correction/corrected_output.csv
+eda/correction/corrected_output.parquet
+eda/correction/data/
+eda/correction/plots/
 
 # Jupyter
 .ipynb_checkpoints/

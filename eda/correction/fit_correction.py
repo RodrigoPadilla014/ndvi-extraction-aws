@@ -47,6 +47,7 @@ import pandas as pd
 from sklearn.linear_model import HuberRegressor, LinearRegression
 from sklearn.metrics import mean_absolute_error, r2_score
 
+import sys; sys.path.insert(0, str(Path(__file__).parent))
 from utils import INDICES, YEARS, build_matched, load_reference, load_stac
 
 EDA_DIR = Path(__file__).parent

@@ -18,7 +18,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
 SSH_HOST = os.environ["SSH_HOST"]
@@ -61,35 +61,20 @@ def open_tunnel():
 
 def load_data(engine):
     df = pd.read_sql(text("""
-        WITH cierres AS (
-            SELECT DISTINCT cod_cg,
-                   TO_DATE(cierre, 'DD/MM/YYYY') AS cierre_date
-            FROM maestra
-            WHERE cod_cg = ANY(:cods) AND cierre IS NOT NULL
-        )
-        SELECT m.cod_cg,
-               m.fecha::date AS fecha,
-               m.ndvi_ref,
-               m.edad_de_cultivo,
-               MIN(c.cierre_date)::text AS cierre_ciclo
-        FROM maestra m
-        LEFT JOIN cierres c
-               ON c.cod_cg = m.cod_cg
-              AND c.cierre_date >= m.fecha::date
-        WHERE m.cod_cg = ANY(:cods)
-          AND m.ndvi_ref IS NOT NULL
-        GROUP BY m.cod_cg, m.fecha, m.ndvi_ref, m.edad_de_cultivo
-        ORDER BY m.cod_cg, m.fecha
+        SELECT cod_cg,
+               fecha::date        AS fecha,
+               ndvi_ref,
+               edad_de_cultivo,
+               cierre_ciclo::text AS cierre_ciclo
+        FROM maestra
+        WHERE cod_cg = ANY(:cods)
+          AND ndvi_ref IS NOT NULL
+        ORDER BY cod_cg, fecha
     """), engine, params={"cods": FIXED_LOTS})
 
-    # Renovation points: edad > 200 AND ndvi < 0.2
-    # Includes both cycles with known cierre and NULL cierre (missing from productividad)
-    # For NULL cierre cycles, we detect multiple drops by finding local minima separated
-    # by a recovery — we pick the first obs per "drop event" using a LAG-based approach.
     renovations = pd.read_sql(text("""
-        WITH
-        -- Known cierre: one point per cycle (first obs with edad>200 and ndvi<0.2)
-        known_cierre AS (
+        SELECT * FROM (
+            -- Pre-harvest drops within productividad cycles
             SELECT DISTINCT ON (cod_cg, cierre_ciclo)
                    cod_cg, cierre_ciclo::text, fecha::date AS fecha,
                    ndvi_ref, edad_de_cultivo
@@ -97,36 +82,29 @@ def load_data(engine):
             WHERE cod_cg = ANY(:cods)
               AND gap_in_data = FALSE
               AND cierre_ciclo IS NOT NULL
+              AND cierre IS NOT NULL
               AND edad_de_cultivo > 200
               AND ndvi_ref < 0.2
               AND fecha::date < cierre_ciclo
             ORDER BY cod_cg, cierre_ciclo, fecha
-        ),
-        -- NULL cierre: LAG over ALL obs (not just candidates) to detect recoveries
-        all_null AS (
-            SELECT cod_cg, fecha::date AS fecha, ndvi_ref, edad_de_cultivo,
-                   LAG(ndvi_ref) OVER (PARTITION BY cod_cg ORDER BY fecha) AS prev_ndvi
+        ) pre_harvest
+
+        UNION ALL
+
+        SELECT * FROM (
+            -- Renovation-detected cycle boundaries (cierre_ciclo set by migration 010)
+            SELECT DISTINCT ON (cod_cg, cierre_ciclo)
+                   cod_cg, cierre_ciclo::text, fecha::date AS fecha,
+                   ndvi_ref, edad_de_cultivo
             FROM maestra
             WHERE cod_cg = ANY(:cods)
               AND gap_in_data = FALSE
-              AND cierre_ciclo IS NULL
-        ),
-        null_candidates AS (
-            SELECT cod_cg, NULL::text AS cierre_ciclo, fecha, ndvi_ref, edad_de_cultivo,
-                   SUM(CASE WHEN prev_ndvi IS NULL OR prev_ndvi >= 0.2 THEN 1 ELSE 0 END)
-                       OVER (PARTITION BY cod_cg ORDER BY fecha) AS event_id
-            FROM all_null
-            WHERE edad_de_cultivo > 200 AND ndvi_ref < 0.2
-        ),
-        null_cierre AS (
-            SELECT DISTINCT ON (cod_cg, event_id)
-                   cod_cg, cierre_ciclo, fecha, ndvi_ref, edad_de_cultivo
-            FROM null_candidates
-            ORDER BY cod_cg, event_id, fecha
-        )
-        SELECT cod_cg, cierre_ciclo, fecha, ndvi_ref, edad_de_cultivo FROM known_cierre
-        UNION ALL
-        SELECT cod_cg, cierre_ciclo, fecha, ndvi_ref, edad_de_cultivo FROM null_cierre
+              AND cierre_ciclo IS NOT NULL
+              AND cierre IS NULL
+              AND edad_de_cultivo > 200
+              AND ndvi_ref < 0.2
+            ORDER BY cod_cg, cierre_ciclo, fecha
+        ) renovations_detected
     """), engine, params={"cods": FIXED_LOTS})
 
     print(f"Rows loaded: {len(df):,}  |  Renovation points: {len(renovations)}")
@@ -144,90 +122,32 @@ def build_html(df, renovations):
     for cod_cg, lot_df in df.groupby("cod_cg"):
         lot_df = lot_df.sort_values("fecha")
         all_ciclos = sorted(c for c in lot_df["cierre_ciclo"].unique() if c is not None)
-        # observations with no future cierre (last cycle, no known end)
         has_null = lot_df["cierre_ciclo"].isna().any()
 
         lot_renovs = renovations[renovations["cod_cg"] == cod_cg]
-        # Map cierre_ciclo -> renovation fecha for quick lookup
-        renov_map = {
-            str(r.cierre_ciclo): str(r.fecha)
-            for r in lot_renovs.itertuples()
-            if pd.notna(r.cierre_ciclo)
-        }
 
         traces = []
         color_idx = 0
         for ciclo in all_ciclos:
             cyc = lot_df[lot_df["cierre_ciclo"] == ciclo].sort_values("fecha")
-            renov_fecha = renov_map.get(ciclo)
-
-            if renov_fecha:
-                # Split: before renovation (old cycle) and after (new cycle)
-                before = cyc[cyc["fecha"].astype(str) <= renov_fecha]
-                after  = cyc[cyc["fecha"].astype(str) >  renov_fecha]
-
-                def make_trace(sub, label, color):
-                    return {
-                        "label": label,
-                        "color": color,
-                        "fecha": [str(v) for v in sub["fecha"]],
-                        "ndvi":  [round(float(v), 4) for v in sub["ndvi_ref"]],
-                        "edad":  [int(v) if pd.notna(v) else None for v in sub["edad_de_cultivo"]],
-                    }
-
-                if not before.empty:
-                    traces.append(make_trace(before, ciclo, COLORS[color_idx % len(COLORS)]))
-                    color_idx += 1
-                if not after.empty:
-                    traces.append(make_trace(after, f"{ciclo} (post-renov)", COLORS[color_idx % len(COLORS)]))
-                    color_idx += 1
-            else:
-                traces.append({
-                    "label": ciclo,
-                    "color": COLORS[color_idx % len(COLORS)],
-                    "fecha": [str(v) for v in cyc["fecha"]],
-                    "ndvi":  [round(float(v), 4) for v in cyc["ndvi_ref"]],
-                    "edad":  [int(v) if pd.notna(v) else None for v in cyc["edad_de_cultivo"]],
-                })
-                color_idx += 1
+            traces.append({
+                "label": ciclo,
+                "color": COLORS[color_idx % len(COLORS)],
+                "fecha": [str(v) for v in cyc["fecha"]],
+                "ndvi":  [round(float(v), 4) for v in cyc["ndvi_ref"]],
+                "edad":  [int(v) if pd.notna(v) else None for v in cyc["edad_de_cultivo"]],
+            })
+            color_idx += 1
 
         if has_null:
             cyc = lot_df[lot_df["cierre_ciclo"].isna()].sort_values("fecha")
-            # Get all renovation points for NULL cierre, sorted by fecha
-            null_renovs = lot_renovs[lot_renovs["cierre_ciclo"].isna()].sort_values("fecha")
-            renov_fechas = [str(r.fecha) for r in null_renovs.itertuples()]
-
-            if renov_fechas:
-                # Split the NULL segment at each renovation point
-                segments = []
-                remaining = cyc.copy()
-                for rf in renov_fechas:
-                    before = remaining[remaining["fecha"].astype(str) <= rf]
-                    remaining = remaining[remaining["fecha"].astype(str) > rf]
-                    if not before.empty:
-                        segments.append(before)
-                if not remaining.empty:
-                    segments.append(remaining)
-
-                for j, seg in enumerate(segments):
-                    label = "sin cierre" if j == 0 else f"sin cierre (renov {j})"
-                    color = COLORS[color_idx % len(COLORS)]
-                    traces.append({
-                        "label": label,
-                        "color": color,
-                        "fecha": [str(v) for v in seg["fecha"]],
-                        "ndvi":  [round(float(v), 4) for v in seg["ndvi_ref"]],
-                        "edad":  [int(v) if pd.notna(v) else None for v in seg["edad_de_cultivo"]],
-                    })
-                    color_idx += 1
-            else:
-                traces.append({
-                    "label": "sin cierre",
-                    "color": "#aaaaaa",
-                    "fecha": [str(v) for v in cyc["fecha"]],
-                    "ndvi":  [round(float(v), 4) for v in cyc["ndvi_ref"]],
-                    "edad":  [int(v) if pd.notna(v) else None for v in cyc["edad_de_cultivo"]],
-                })
+            traces.append({
+                "label": "sin cierre",
+                "color": "#aaaaaa",
+                "fecha": [str(v) for v in cyc["fecha"]],
+                "ndvi":  [round(float(v), 4) for v in cyc["ndvi_ref"]],
+                "edad":  [int(v) if pd.notna(v) else None for v in cyc["edad_de_cultivo"]],
+            })
 
         renov_list = [
             {

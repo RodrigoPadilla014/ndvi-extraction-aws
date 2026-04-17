@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
 
+import sys; sys.path.insert(0, str(Path(__file__).parent))
 from utils import INDICES, build_matched, load_reference, load_stac
 
 # ---------------------------------------------------------------------------

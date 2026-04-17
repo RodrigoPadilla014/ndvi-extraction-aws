@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine
 
 PROJECT_ROOT = Path(__file__).parent.parent
-INPUT_PATH = PROJECT_ROOT / "eda" / "corrected_output.csv"
+INPUT_PATH = PROJECT_ROOT / "eda" / "correction" / "corrected_output.csv"
 
 load_dotenv(PROJECT_ROOT / ".env")
 
